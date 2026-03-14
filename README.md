@@ -13,7 +13,7 @@
 
 A terminal tool that right-sizes LLM models to your system's RAM, CPU, and GPU. Detects your hardware, scores each model across quality, speed, fit, and context dimensions, and tells you which ones will actually run well on your machine.
 
-Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-GPU setups, MoE architectures, dynamic quantization selection, speed estimation, and local runtime providers (Ollama, llama.cpp, MLX).
+Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-GPU setups, MoE architectures, dynamic quantization selection, speed estimation, and local runtime providers (Ollama, llama.cpp, MLX, Docker Model Runner).
 
 > **Sister project:** Check out [sympozium](https://github.com/AlexsJones/sympozium/) for managing agents in Kubernetes.
 
@@ -415,7 +415,7 @@ src/
   hardware.rs     -- System RAM/CPU/GPU detection (multi-GPU, backend identification)
   models.rs       -- Model database, quantization hierarchy, dynamic quant selection
   fit.rs          -- Multi-dimensional scoring (Q/S/F/C), speed estimation, MoE offloading
-  providers.rs    -- Runtime provider integration (Ollama, llama.cpp, MLX), install detection, pull/download
+  providers.rs    -- Runtime provider integration (Ollama, llama.cpp, MLX, Docker Model Runner), install detection, pull/download
   display.rs      -- Classic CLI table rendering + JSON output
   tui_app.rs      -- TUI application state, filters, navigation
   tui_ui.rs       -- TUI rendering (ratatui)
@@ -492,6 +492,7 @@ llmfit supports multiple local runtime providers:
 - **Ollama** (daemon/API based pulls)
 - **llama.cpp** (direct GGUF downloads from Hugging Face + local cache detection)
 - **MLX** (Apple Silicon / mlx-community model cache + optional server)
+- **Docker Model Runner** (Docker Desktop's built-in model serving)
 
 When more than one compatible provider is available for a model, pressing `d` in the TUI opens a provider picker modal.
 
@@ -548,6 +549,29 @@ How it works:
 - llmfit maps HF models to known GGUF repos (with heuristic fallbacks)
 - downloads GGUF files into the local llama.cpp model cache
 - marks models installed when matching GGUF files are present locally
+
+### Docker Model Runner integration
+
+llmfit integrates with [Docker Model Runner](https://docs.docker.com/desktop/features/model-runner/), Docker Desktop's built-in model serving feature.
+
+Requirements:
+
+- Docker Desktop with Model Runner enabled
+- Default endpoint: `http://localhost:12434`
+
+How it works:
+
+- llmfit queries `GET /engines` to list models available in Docker Model Runner
+- models are matched to the HF database using Ollama-style tag mapping (Docker Model Runner uses `ai/<tag>` naming)
+- pressing `d` in the TUI pulls via `docker model pull`
+
+### Remote Docker Model Runner instances
+
+To connect to Docker Model Runner on a different host or port, set the `DOCKER_MODEL_RUNNER_HOST` environment variable:
+
+```sh
+DOCKER_MODEL_RUNNER_HOST="http://192.168.1.100:12434" llmfit
+```
 
 ### Model name mapping
 

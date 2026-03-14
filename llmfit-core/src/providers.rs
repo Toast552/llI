@@ -1,4 +1,4 @@
-//! Runtime model providers (Ollama, llama.cpp, MLX).
+//! Runtime model providers (Ollama, llama.cpp, MLX, Docker Model Runner).
 //!
 //! Each provider can list locally installed models and pull new ones.
 //! The trait is designed to be extended for vLLM, etc.
@@ -1018,6 +1018,269 @@ impl ModelProvider for LlamaCppProvider {
         let (filename, _) = &files[0];
         self.download_gguf(repo_id, filename)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Docker Model Runner provider
+// ---------------------------------------------------------------------------
+
+/// Docker Model Runner — Docker Desktop's built-in model serving feature.
+///
+/// Exposes an OpenAI-compatible API at `http://localhost:12434` by default.
+/// Models are listed via `GET /engines` and pulled via `docker model pull`.
+pub struct DockerModelRunnerProvider {
+    base_url: String,
+}
+
+fn normalize_docker_mr_host(raw: &str) -> Option<String> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return None;
+    }
+
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return Some(host.to_string());
+    }
+
+    if host.contains("://") {
+        return None;
+    }
+
+    Some(format!("http://{host}"))
+}
+
+impl Default for DockerModelRunnerProvider {
+    fn default() -> Self {
+        let base_url = std::env::var("DOCKER_MODEL_RUNNER_HOST")
+            .ok()
+            .and_then(|raw| {
+                let normalized = normalize_docker_mr_host(&raw);
+                if normalized.is_none() {
+                    eprintln!(
+                        "Warning: could not parse DOCKER_MODEL_RUNNER_HOST='{}'. \
+                         Expected host:port or http(s)://host:port",
+                        raw
+                    );
+                }
+                normalized
+            })
+            .unwrap_or_else(|| "http://localhost:12434".to_string());
+        Self { base_url }
+    }
+}
+
+impl DockerModelRunnerProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Single-pass startup probe.
+    /// Returns `(available, installed_models, count)`.
+    pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
+        let mut set = HashSet::new();
+        let Ok(resp) = ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_millis(800)))
+            .build()
+            .call()
+        else {
+            return (false, set, 0);
+        };
+
+        let Ok(list) = resp.into_body().read_json::<DockerModelList>() else {
+            return (true, set, 0);
+        };
+        let engines = list.data;
+        let count = engines.len();
+        for e in engines {
+            let lower = e.id.to_lowercase();
+            set.insert(lower.clone());
+            // Also insert the model part after the namespace (e.g. "ai/llama3.1" → "llama3.1")
+            if let Some(name) = lower.split('/').next_back() {
+                if name != lower {
+                    set.insert(name.to_string());
+                }
+            }
+            // Strip quantization tag if present (e.g. "llama3.1:8B-Q4_K_M" → "llama3.1:8b")
+            if let Some(base) = lower.split(':').next() {
+                set.insert(base.to_string());
+            }
+        }
+        (true, set, count)
+    }
+
+    pub fn installed_models_counted(&self) -> (HashSet<String>, usize) {
+        let (_, set, count) = self.detect_with_installed();
+        (set, count)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DockerModelList {
+    data: Vec<DockerEngine>,
+}
+
+#[derive(serde::Deserialize)]
+struct DockerEngine {
+    /// Model ID, e.g. "ai/llama3.1:8B-Q4_K_M"
+    id: String,
+}
+
+impl ModelProvider for DockerModelRunnerProvider {
+    fn name(&self) -> &str {
+        "Docker Model Runner"
+    }
+
+    fn is_available(&self) -> bool {
+        ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(2)))
+            .build()
+            .call()
+            .is_ok()
+    }
+
+    fn installed_models(&self) -> HashSet<String> {
+        let (set, _) = self.installed_models_counted();
+        set
+    }
+
+    fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
+        let tag = model_tag.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let _ = tx.send(PullEvent::Progress {
+                status: format!("Pulling {} via docker model pull...", tag),
+                percent: None,
+            });
+
+            let result = std::process::Command::new("docker")
+                .args(["model", "pull", &tag])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output();
+
+            match result {
+                Ok(output) if output.status.success() => {
+                    let _ = tx.send(PullEvent::Done);
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let _ = tx.send(PullEvent::Error(format!(
+                        "docker model pull failed: {}",
+                        stderr.trim()
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(PullEvent::Error(format!(
+                        "Failed to run docker: {e}"
+                    )));
+                }
+            }
+        });
+
+        Ok(PullHandle {
+            model_tag: model_tag.to_string(),
+            receiver: rx,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Docker Model Runner name-matching helpers
+// ---------------------------------------------------------------------------
+
+/// Embedded catalog of HF models confirmed to exist in Docker Hub's ai/ namespace.
+/// Generated by `scripts/scrape_docker_models.py` and refreshed alongside the model DB.
+const DOCKER_MODELS_JSON: &str = include_str!("../data/docker_models.json");
+
+#[derive(serde::Deserialize)]
+struct DockerModelCatalog {
+    models: Vec<DockerModelEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct DockerModelEntry {
+    hf_name: String,
+    docker_tag: String,
+}
+
+/// Lazily parsed Docker Model Runner catalog.
+fn docker_mr_catalog() -> &'static [(String, String)] {
+    use std::sync::OnceLock;
+    static CATALOG: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let Ok(catalog) = serde_json::from_str::<DockerModelCatalog>(DOCKER_MODELS_JSON) else {
+            return Vec::new();
+        };
+        catalog
+            .models
+            .into_iter()
+            .map(|e| (e.hf_name.to_lowercase(), e.docker_tag))
+            .collect()
+    })
+}
+
+/// Returns `true` if this HF model has a confirmed Docker Model Runner image.
+pub fn has_docker_mr_mapping(hf_name: &str) -> bool {
+    docker_mr_pull_tag(hf_name).is_some()
+}
+
+/// Given an HF model name, return the Docker Model Runner tag to use for pulling.
+/// Returns `None` if the model has no confirmed Docker image.
+pub fn docker_mr_pull_tag(hf_name: &str) -> Option<String> {
+    let lower = hf_name.to_lowercase();
+    docker_mr_catalog()
+        .iter()
+        .find(|(name, _)| *name == lower)
+        .map(|(_, tag)| tag.clone())
+}
+
+/// Docker Model Runner uses the Ollama naming convention (e.g. "ai/llama3.1:8b").
+/// We generate candidates from the confirmed catalog, plus base-name variants for
+/// matching against locally installed models.
+pub fn hf_name_to_docker_mr_candidates(hf_name: &str) -> Vec<String> {
+    let Some(tag) = docker_mr_pull_tag(hf_name) else {
+        return Vec::new();
+    };
+    let mut candidates = vec![tag.clone()];
+    // Also add without "ai/" prefix for matching installed models
+    if let Some(stripped) = tag.strip_prefix("ai/") {
+        candidates.push(stripped.to_string());
+    }
+    // Add base repo name (without size tag) e.g. "ai/llama3.1"
+    if let Some(base) = tag.split(':').next() {
+        candidates.push(base.to_string());
+    }
+    candidates
+}
+
+/// Check if any of the Docker Model Runner candidates for an HF model
+/// appear in the installed set.
+pub fn is_model_installed_docker_mr(hf_name: &str, installed: &HashSet<String>) -> bool {
+    let candidates = hf_name_to_docker_mr_candidates(hf_name);
+    candidates.iter().any(|candidate| {
+        installed
+            .iter()
+            .any(|installed_name| docker_mr_installed_matches(installed_name, candidate))
+    })
+}
+
+fn docker_mr_installed_matches(installed_name: &str, candidate: &str) -> bool {
+    if installed_name == candidate {
+        return true;
+    }
+    // Allow variant tags, e.g. candidate "ai/llama3.1:8b" matching
+    // installed "ai/llama3.1:8b-q4_k_m"
+    if candidate.contains(':') {
+        return installed_name.starts_with(&format!("{candidate}-"));
+    }
+    false
 }
 
 /// Strip quantization suffix from a GGUF file stem.
@@ -2232,5 +2495,99 @@ mod tests {
         assert!(!hf_name_to_ollama_candidates("meta-llama/Llama-3.1-8B-Instruct").is_empty());
         assert!(!hf_name_to_ollama_candidates("Qwen/Qwen2.5-Coder-7B-Instruct").is_empty());
         assert!(!hf_name_to_ollama_candidates("google/gemma-2-9b-it").is_empty());
+    }
+
+    // ── Docker Model Runner ─────────────────────────────────────────
+
+    #[test]
+    fn test_docker_mr_catalog_parses() {
+        // The embedded catalog should parse without errors
+        let catalog = docker_mr_catalog();
+        assert!(!catalog.is_empty(), "Docker MR catalog should not be empty");
+    }
+
+    #[test]
+    fn test_has_docker_mr_mapping_known() {
+        // Llama 3.1 70B is in both our HF database and Docker Hub ai/ namespace
+        assert!(has_docker_mr_mapping("meta-llama/Llama-3.1-70B-Instruct"));
+    }
+
+    #[test]
+    fn test_has_docker_mr_mapping_unknown() {
+        assert!(!has_docker_mr_mapping("totally-unknown/model-xyz"));
+    }
+
+    #[test]
+    fn test_docker_mr_pull_tag_returns_ai_prefixed() {
+        let tag = docker_mr_pull_tag("meta-llama/Llama-3.1-70B-Instruct");
+        assert!(tag.is_some());
+        assert!(tag.unwrap().starts_with("ai/"));
+    }
+
+    #[test]
+    fn test_docker_mr_candidates_includes_ai_prefix() {
+        let candidates = hf_name_to_docker_mr_candidates("meta-llama/Llama-3.1-70B-Instruct");
+        assert!(candidates.iter().any(|c| c.starts_with("ai/")));
+    }
+
+    #[test]
+    fn test_docker_mr_candidates_unknown_returns_empty() {
+        let candidates = hf_name_to_docker_mr_candidates("totally-unknown/model-xyz");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_is_model_installed_docker_mr_exact() {
+        let mut installed = HashSet::new();
+        installed.insert("ai/llama3.1:70b".to_string());
+        installed.insert("llama3.1:70b".to_string());
+        installed.insert("llama3.1".to_string());
+        assert!(is_model_installed_docker_mr(
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_is_model_installed_docker_mr_variant_suffix() {
+        let mut installed = HashSet::new();
+        installed.insert("ai/llama3.1:70b-q4_k_m".to_string());
+        assert!(is_model_installed_docker_mr(
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_is_model_installed_docker_mr_not_installed() {
+        let installed = HashSet::new();
+        assert!(!is_model_installed_docker_mr(
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_normalize_docker_mr_host_with_scheme() {
+        assert_eq!(
+            normalize_docker_mr_host("https://docker.example.com:12434"),
+            Some("https://docker.example.com:12434".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_docker_mr_host_without_scheme() {
+        assert_eq!(
+            normalize_docker_mr_host("docker.example.com:12434"),
+            Some("http://docker.example.com:12434".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_docker_mr_host_rejects_unsupported_scheme() {
+        assert_eq!(
+            normalize_docker_mr_host("ftp://docker.example.com:12434"),
+            None
+        );
     }
 }

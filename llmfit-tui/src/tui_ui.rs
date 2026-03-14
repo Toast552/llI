@@ -11,7 +11,8 @@ use ratatui::{
 
 use crate::theme::ThemeColors;
 use crate::tui_app::{
-    App, AvailabilityFilter, DownloadCapability, DownloadProvider, FitFilter, InputMode, PlanField,
+    App, AvailabilityFilter, DL_DOCKER, DL_LLAMACPP, DL_OLLAMA, DownloadCapability,
+    DownloadProvider, FitFilter, InputMode, PlanField,
 };
 use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::is_running_in_wsl;
@@ -150,6 +151,17 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         tc.muted
     };
 
+    let docker_mr_info = if app.docker_mr_available {
+        format!("Docker: ✓ ({} models)", app.docker_mr_installed_count)
+    } else {
+        "Docker: ✗".to_string()
+    };
+    let docker_mr_color = if app.docker_mr_available {
+        tc.good
+    } else {
+        tc.muted
+    };
+
     let mut spans = vec![
         Span::styled(" CPU: ", Style::default().fg(tc.muted)),
         Span::styled(
@@ -178,6 +190,8 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Span::styled(mlx_info, Style::default().fg(mlx_color)),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
         Span::styled(llamacpp_info, Style::default().fg(llamacpp_color)),
+        Span::styled("  │  ", Style::default().fg(tc.muted)),
+        Span::styled(docker_mr_info, Style::default().fg(docker_mr_color)),
     ];
 
     if app.backend_hidden_count > 0 {
@@ -552,10 +566,23 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
             } else {
                 match capability {
                     DownloadCapability::Unknown => " …".to_string(),
-                    DownloadCapability::None => " —".to_string(),
-                    DownloadCapability::Ollama => " O".to_string(),
-                    DownloadCapability::LlamaCpp => " L".to_string(),
-                    DownloadCapability::Both => "OL".to_string(),
+                    DownloadCapability::Known(flags) => {
+                        if flags == 0 {
+                            " —".to_string()
+                        } else {
+                            let mut s = String::new();
+                            if flags & DL_OLLAMA != 0 {
+                                s.push('O');
+                            }
+                            if flags & DL_LLAMACPP != 0 {
+                                s.push('L');
+                            }
+                            if flags & DL_DOCKER != 0 {
+                                s.push('D');
+                            }
+                            format!("{:>2}", s)
+                        }
+                    }
                 }
             };
             let installed_color = if fit.installed {
@@ -565,10 +592,8 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
             } else {
                 match capability {
                     DownloadCapability::Unknown => tc.muted,
-                    DownloadCapability::None => tc.muted,
-                    DownloadCapability::Ollama
-                    | DownloadCapability::LlamaCpp
-                    | DownloadCapability::Both => tc.info,
+                    DownloadCapability::Known(0) => tc.muted,
+                    DownloadCapability::Known(_) => tc.info,
                 }
             };
 
@@ -1403,34 +1428,35 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Line::from(vec![
             Span::styled("  Installed:   ", Style::default().fg(tc.muted)),
             {
-                let ollama_installed =
-                    providers::is_model_installed(&fit.model.name, &app.ollama_installed);
-                let mlx_installed =
-                    providers::is_model_installed_mlx(&fit.model.name, &app.mlx_installed);
-                let llamacpp_installed = providers::is_model_installed_llamacpp(
+                let mut installed_providers = Vec::new();
+                if providers::is_model_installed(&fit.model.name, &app.ollama_installed) {
+                    installed_providers.push("Ollama");
+                }
+                if providers::is_model_installed_mlx(&fit.model.name, &app.mlx_installed) {
+                    installed_providers.push("MLX");
+                }
+                if providers::is_model_installed_llamacpp(
                     &fit.model.name,
                     &app.llamacpp_installed,
-                );
+                ) {
+                    installed_providers.push("llama.cpp");
+                }
+                if providers::is_model_installed_docker_mr(
+                    &fit.model.name,
+                    &app.docker_mr_installed,
+                ) {
+                    installed_providers.push("Docker");
+                }
                 let any_available =
-                    app.ollama_available || app.mlx_available || app.llamacpp_available;
+                    app.ollama_available || app.mlx_available || app.llamacpp_available || app.docker_mr_available;
 
-                if ollama_installed && mlx_installed && llamacpp_installed {
-                    Span::styled(
-                        "✓ Ollama  ✓ MLX  ✓ llama.cpp",
-                        Style::default().fg(tc.good).bold(),
-                    )
-                } else if ollama_installed && mlx_installed {
-                    Span::styled("✓ Ollama  ✓ MLX", Style::default().fg(tc.good).bold())
-                } else if ollama_installed && llamacpp_installed {
-                    Span::styled("✓ Ollama  ✓ llama.cpp", Style::default().fg(tc.good).bold())
-                } else if mlx_installed && llamacpp_installed {
-                    Span::styled("✓ MLX  ✓ llama.cpp", Style::default().fg(tc.good).bold())
-                } else if ollama_installed {
-                    Span::styled("✓ Ollama", Style::default().fg(tc.good).bold())
-                } else if mlx_installed {
-                    Span::styled("✓ MLX", Style::default().fg(tc.good).bold())
-                } else if llamacpp_installed {
-                    Span::styled("✓ llama.cpp", Style::default().fg(tc.good).bold())
+                if !installed_providers.is_empty() {
+                    let label = installed_providers
+                        .iter()
+                        .map(|p| format!("✓ {p}"))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    Span::styled(label, Style::default().fg(tc.good).bold())
                 } else if any_available {
                     Span::styled("✗ No  (press d to pull)", Style::default().fg(tc.muted))
                 } else {
@@ -2230,6 +2256,7 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
         let label = match provider {
             DownloadProvider::Ollama => "Ollama",
             DownloadProvider::LlamaCpp => "llama.cpp",
+            DownloadProvider::DockerModelRunner => "Docker Model Runner",
         };
         let is_cursor = i == app.download_provider_cursor;
         let prefix = if is_cursor { ">" } else { " " };
@@ -2275,7 +2302,7 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             } else {
                 "Enter:detail"
             };
-            let any_provider = app.ollama_available || app.mlx_available || app.llamacpp_available;
+            let any_provider = app.ollama_available || app.mlx_available || app.llamacpp_available || app.docker_mr_available;
             let ollama_keys = if any_provider {
                 let installed_key = if app.installed_first {
                     "i:all"

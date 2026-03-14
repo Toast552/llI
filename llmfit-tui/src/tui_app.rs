@@ -3,7 +3,8 @@ use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::{Capability, ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
-    self, LlamaCppProvider, MlxProvider, ModelProvider, OllamaProvider, PullEvent, PullHandle,
+    self, DockerModelRunnerProvider, LlamaCppProvider, MlxProvider, ModelProvider, OllamaProvider,
+    PullEvent, PullHandle,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -116,22 +117,26 @@ impl AvailabilityFilter {
 pub enum DownloadProvider {
     Ollama,
     LlamaCpp,
+    DockerModelRunner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadCapability {
     Unknown,
-    None,
-    Ollama,
-    LlamaCpp,
-    Both,
+    /// Bitfield: OLLAMA=1, LLAMACPP=2, DOCKER=4
+    Known(u8),
 }
+
+pub const DL_OLLAMA: u8 = 0b0001;
+pub const DL_LLAMACPP: u8 = 0b0010;
+pub const DL_DOCKER: u8 = 0b0100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivePullProvider {
     Ollama,
     Mlx,
     LlamaCpp,
+    DockerModelRunner,
 }
 
 impl ActivePullProvider {
@@ -140,6 +145,7 @@ impl ActivePullProvider {
             ActivePullProvider::Ollama => "Ollama",
             ActivePullProvider::Mlx => "MLX",
             ActivePullProvider::LlamaCpp => "llama.cpp",
+            ActivePullProvider::DockerModelRunner => "Docker",
         }
     }
 }
@@ -209,6 +215,10 @@ pub struct App {
     pub llamacpp_installed: HashSet<String>,
     pub llamacpp_installed_count: usize,
     llamacpp: LlamaCppProvider,
+    pub docker_mr_available: bool,
+    pub docker_mr_installed: HashSet<String>,
+    pub docker_mr_installed_count: usize,
+    docker_mr: DockerModelRunnerProvider,
 
     // Download state
     pub pull_active: Option<PullHandle>,
@@ -274,6 +284,11 @@ impl App {
         let llamacpp_available = llamacpp.is_available();
         let (llamacpp_installed, llamacpp_installed_count) = llamacpp.installed_models_counted();
 
+        // Detect Docker Model Runner
+        let docker_mr = DockerModelRunnerProvider::new();
+        let (docker_mr_available, docker_mr_installed, docker_mr_installed_count) =
+            docker_mr.detect_with_installed();
+
         // Track how many we're skipping so the UI can surface it.
         let backend_hidden_count = db
             .get_all_models()
@@ -290,7 +305,8 @@ impl App {
                 let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
                 fit.installed = providers::is_model_installed(&m.name, &ollama_installed)
                     || providers::is_model_installed_mlx(&m.name, &mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &llamacpp_installed);
+                    || providers::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
+                    || providers::is_model_installed_docker_mr(&m.name, &docker_mr_installed);
                 fit
             })
             .collect();
@@ -411,6 +427,10 @@ impl App {
             llamacpp_installed,
             llamacpp_installed_count,
             llamacpp,
+            docker_mr_available,
+            docker_mr_installed,
+            docker_mr_installed_count,
+            docker_mr,
             pull_active: None,
             pull_status: None,
             pull_percent: None,
@@ -1312,9 +1332,13 @@ impl App {
 
     /// Start pulling the currently selected model via the best available provider.
     pub fn start_download(&mut self) {
-        let any_available = self.ollama_available || self.mlx_available || self.llamacpp_available;
+        let any_available = self.ollama_available
+            || self.mlx_available
+            || self.llamacpp_available
+            || self.docker_mr_available;
         if !any_available {
-            self.pull_status = Some("No provider available (Ollama/MLX/llama.cpp)".to_string());
+            self.pull_status =
+                Some("No provider available (Ollama/MLX/llama.cpp/Docker)".to_string());
             return;
         }
         if self.pull_active.is_some() {
@@ -1345,11 +1369,13 @@ impl App {
             let any_runtime = self.ollama_available
                 || self.ollama_binary_available
                 || self.llamacpp_available
-                || self.mlx_available;
+                || self.mlx_available
+                || self.docker_mr_available;
             self.pull_status = Some(if any_runtime {
                 "No downloadable format found for this model".to_string()
             } else {
-                "No compatible runtime available — install Ollama or llama.cpp".to_string()
+                "No compatible runtime available — install Ollama, llama.cpp, or Docker"
+                    .to_string()
             });
         }
     }
@@ -1379,6 +1405,7 @@ impl App {
         match provider {
             DownloadProvider::Ollama => self.start_ollama_download(model_name),
             DownloadProvider::LlamaCpp => self.start_llamacpp_download_for_model(model_name),
+            DownloadProvider::DockerModelRunner => self.start_docker_mr_download(model_name),
         }
     }
 
@@ -1426,6 +1453,25 @@ impl App {
             }
             Err(e) => {
                 self.pull_status = Some(format!("GGUF download failed: {}", e));
+            }
+        }
+    }
+
+    fn start_docker_mr_download(&mut self, model_name: String) {
+        let Some(docker_tag) = providers::docker_mr_pull_tag(&model_name) else {
+            self.pull_status = Some("Not available for Docker Model Runner".to_string());
+            return;
+        };
+        match self.docker_mr.start_pull(&docker_tag) {
+            Ok(handle) => {
+                self.pull_model_name = Some(model_name);
+                self.pull_status = Some(format!("Pulling {} via Docker...", docker_tag));
+                self.pull_percent = None;
+                self.pull_provider = Some(ActivePullProvider::DockerModelRunner);
+                self.pull_active = Some(handle);
+            }
+            Err(e) => {
+                self.pull_status = Some(format!("Docker pull failed: {}", e));
             }
         }
     }
@@ -1501,6 +1547,9 @@ impl App {
         {
             providers_for_model.push(DownloadProvider::LlamaCpp);
         }
+        if self.docker_mr_available && providers::has_docker_mr_mapping(model_name) {
+            providers_for_model.push(DownloadProvider::DockerModelRunner);
+        }
         providers_for_model
     }
 
@@ -1562,12 +1611,19 @@ impl App {
         let (llamacpp_set, llamacpp_count) = self.llamacpp.installed_models_counted();
         self.llamacpp_installed = llamacpp_set;
         self.llamacpp_installed_count = llamacpp_count;
+        let (docker_mr_set, docker_mr_count) = self.docker_mr.installed_models_counted();
+        self.docker_mr_installed = docker_mr_set;
+        self.docker_mr_installed_count = docker_mr_count;
         for fit in &mut self.all_fits {
             fit.installed = providers::is_model_installed(&fit.model.name, &self.ollama_installed)
                 || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
                 || providers::is_model_installed_llamacpp(
                     &fit.model.name,
                     &self.llamacpp_installed,
+                )
+                || providers::is_model_installed_docker_mr(
+                    &fit.model.name,
+                    &self.docker_mr_installed,
                 );
         }
         self.re_sort();
@@ -1608,6 +1664,7 @@ impl App {
         let tx = self.download_capability_tx.clone();
         let ollama_runtime_available = self.ollama_available || self.ollama_binary_available;
         let llamacpp_available = self.llamacpp_available;
+        let docker_mr_available = self.docker_mr_available;
         std::thread::spawn(move || {
             let has_ollama = ollama_runtime_available && providers::has_ollama_mapping(&model_name);
             let has_llamacpp = if llamacpp_available {
@@ -1616,14 +1673,19 @@ impl App {
             } else {
                 false
             };
+            let has_docker = docker_mr_available && providers::has_docker_mr_mapping(&model_name);
 
-            let capability = match (has_ollama, has_llamacpp) {
-                (true, true) => DownloadCapability::Both,
-                (true, false) => DownloadCapability::Ollama,
-                (false, true) => DownloadCapability::LlamaCpp,
-                (false, false) => DownloadCapability::None,
-            };
-            let _ = tx.send((model_name, capability));
+            let mut flags = 0u8;
+            if has_ollama {
+                flags |= DL_OLLAMA;
+            }
+            if has_llamacpp {
+                flags |= DL_LLAMACPP;
+            }
+            if has_docker {
+                flags |= DL_DOCKER;
+            }
+            let _ = tx.send((model_name, DownloadCapability::Known(flags)));
         });
     }
 
